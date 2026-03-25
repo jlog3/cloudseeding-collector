@@ -1,0 +1,25 @@
+{
+  "name": "cloudseeding-collector",
+  "version": "1.0.0",
+  "description": "CONUS-wide flight + weather data collector for cloud seeding transparency analysis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/cloudseeding-collector.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "setup": "node setup-db.js",
+    "collect": "node collect.js",
+    "collect:loop": "node collect-loop.js",
+    "serve": "node serve.js",
+    "start": "node collect-loop.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
+  }
+}

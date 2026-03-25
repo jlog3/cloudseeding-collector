@@ -1,0 +1,9 @@
+# CloudSeeding Data Collector — sample crontab entries
+# Install with: crontab crontab.sample
+# Or append with: crontab -l | cat - crontab.sample | crontab -
+
+# Collect every 5 minutes
+*/5 * * * * cd /path/to/collector && /usr/bin/node collect.js >> collector.log 2>&1
+
+# Optional: compact the database weekly (reclaims space from deleted rows)
+0 3 * * 0 cd /path/to/collector && sqlite3 cloudseeding.db "VACUUM;" >> collector.log 2>&1
