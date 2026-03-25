@@ -6,6 +6,8 @@ Pick whichever option fits your situation.
 ## Option 1: Railway.app (easiest, free tier)
 
 Railway gives you a persistent process + a public URL for the API.
+Both the collector and API server run in a single service (Railway
+doesn't support shared volumes between services).
 
 ```bash
 # Install Railway CLI
@@ -19,29 +21,38 @@ railway init
 railway up
 ```
 
-That's it. Railway reads the Dockerfile, builds it, runs `collect-loop.js`.
-The SQLite file persists in the container's filesystem.
+Railway auto-detects the Dockerfile, builds it, runs `start.js` which
+launches both the collector loop and the API server in one process.
 
-To also run the API server, add a second service in the Railway dashboard
-pointing to the same repo with the start command `node serve.js`.
+**After deploy:**
 
-**Cost:** Free tier covers this easily. The collector uses ~50MB RAM and
-negligible CPU (one API call every 5 minutes).
+1. Add a **volume**: press `Cmd+K` (or `Ctrl+K`), type "volume",
+   select your service, set mount path to `/app/data`
+2. Add **environment variables** in the Variables tab:
+   ```
+   DB_PATH=/app/data/cloudseeding.db
+   PORT=4000
+   COLLECT_INTERVAL_MS=300000
+   ```
+3. Under **Settings → Networking**, click **"Generate Domain"**
+   to get a public URL for the API
+4. Redeploy after adding the volume
+
+**Cost:** Hobby plan is $5/month with $5 included credit. This collector
+uses ~$1-2/month of resources — fits within the free credit.
 
 
 ## Option 2: Render.com (free background worker)
 
 1. Go to https://render.com, sign in with GitHub
-2. Click "New" → "Background Worker"
+2. Click "New" → "Web Service" (not background worker — we need the port)
 3. Connect your `cloudseeding-collector` repo
 4. Build command: `npm install`
-5. Start command: `node collect-loop.js`
-6. Environment: set `DB_PATH=/data/cloudseeding.db`
+5. Start command: `node start.js`
+6. Environment: set `DB_PATH=/data/cloudseeding.db` and `PORT=4000`
 7. Add a Disk: mount path `/data`, size 1 GB
 
-For the API, create a second "Web Service" from the same repo:
-- Start command: `node serve.js`
-- It gets a public URL automatically.
+This runs both the collector and API server. You get a public URL automatically.
 
 **Cost:** Free tier works. Add the disk ($0.25/month for 1 GB).
 
@@ -58,7 +69,7 @@ fly volumes create cloudseeding_data --size 1
 fly deploy
 ```
 
-Edit `fly.toml` to mount the volume:
+Edit `fly.toml` to mount the volume and expose the API port:
 ```toml
 [mounts]
   source = "cloudseeding_data"
@@ -66,6 +77,10 @@ Edit `fly.toml` to mount the volume:
 
 [env]
   DB_PATH = "/data/cloudseeding.db"
+  PORT = "4000"
+
+[[services]]
+  internal_port = 4000
 ```
 
 **Cost:** Free tier covers 1 machine with 256MB RAM. Plenty.
@@ -84,10 +99,9 @@ cd cloudseeding-collector
 npm install
 node setup-db.js
 
-# Run with pm2 (process manager)
+# Run with pm2 (process manager) — single process handles both
 npm install -g pm2
-pm2 start collect-loop.js --name collector
-pm2 start serve.js --name collector-api
+pm2 start start.js --name cloudseeding
 pm2 save
 pm2 startup  # auto-start on reboot
 ```
@@ -105,11 +119,10 @@ cd cloudseeding-collector
 docker compose up -d
 ```
 
-This starts both the collector and API server. Data persists in a Docker volume.
+This starts both the collector and API server in one container. Data persists in a Docker volume.
 
 ```bash
-docker compose logs -f collector  # watch collection cycles
-docker compose logs -f api        # watch API requests
+docker compose logs -f    # watch both collector + API output
 ```
 
 
@@ -121,8 +134,7 @@ git clone https://github.com/YOUR_USER/cloudseeding-collector.git
 cd cloudseeding-collector
 npm install
 node setup-db.js
-pm2 start collect-loop.js --name collector
-pm2 start serve.js --name collector-api
+pm2 start start.js --name cloudseeding
 pm2 save && pm2 startup
 ```
 

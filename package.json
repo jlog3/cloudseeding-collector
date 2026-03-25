@@ -12,7 +12,7 @@
     "collect": "node collect.js",
     "collect:loop": "node collect-loop.js",
     "serve": "node serve.js",
-    "start": "node collect-loop.js"
+    "start": "node start.js"
   },
   "engines": {
     "node": ">=18.0.0"

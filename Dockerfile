@@ -15,5 +15,5 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 
-# Default: run the loop collector
-CMD ["node", "collect-loop.js"]
+# Default: run both collector + API server
+CMD ["node", "start.js"]

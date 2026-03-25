@@ -1,22 +1,12 @@
 version: "3.8"
 
-# Run both the collector and the API server sharing one database file.
+# Single service running both collector + API server.
 # Usage: docker compose up -d
 
 services:
-  collector:
+  cloudseeding:
     build: .
-    command: node collect-loop.js
-    volumes:
-      - db-data:/app/data
-    environment:
-      - DB_PATH=/app/data/cloudseeding.db
-      - COLLECT_INTERVAL_MS=300000
-    restart: unless-stopped
-
-  api:
-    build: .
-    command: node serve.js
+    command: node start.js
     ports:
       - "${PORT:-4000}:4000"
     volumes:
@@ -24,9 +14,8 @@ services:
     environment:
       - DB_PATH=/app/data/cloudseeding.db
       - PORT=4000
+      - COLLECT_INTERVAL_MS=300000
     restart: unless-stopped
-    depends_on:
-      - collector
 
 volumes:
   db-data:
