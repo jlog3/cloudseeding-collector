@@ -245,28 +245,40 @@ async function collect() {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // COMPACTION — turn 48h-old flight detail into per-callsign hourly rows
+  // SMART COMPACTION — event-triggered preservation
+  //
+  // For each hour being compacted:
+  //   1. Detect loiter patterns (racetrack/orbit = seeding flight profile)
+  //   2. Check for known seeder presence
+  //   3. Check weather correlation (cloud spike, precip onset)
+  //   4. Score the hour
+  //   5. If score ≥ threshold → preserve full detail permanently
+  //   6. Otherwise → compact to hourly summary, discard raw data
+  //
+  // Preserved hours include a ±2h context window so analysts can trace
+  // the full sequence: aircraft arrival → operations → weather change.
   // ══════════════════════════════════════════════════════════════════════════
+
+  const PRESERVE_THRESHOLD = 30;    // score to trigger preservation
+  const CONTEXT_HOURS_BEFORE = 2;
+  const CONTEXT_HOURS_AFTER = 1;
+  // Loiter detection: ≥6 sightings in an hour with <0.3° total spread
+  const LOITER_MIN_SIGHTINGS = 6;
+  const LOITER_MAX_SPREAD = 0.3;    // degrees lat+lng combined
 
   const compactCutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString();
 
-  const oldRows = db.prepare(`
-    SELECT strftime('%Y-%m-%dT%H:00:00', poll_time) as hour,
-           callsign, icao24, is_known_seeder, operator, aircraft_type,
-           MIN(lat) as min_lat, MAX(lat) as max_lat,
-           MIN(lng) as min_lng, MAX(lng) as max_lng,
-           AVG(lat) as avg_lat, AVG(lng) as avg_lng,
-           MIN(altitude_ft) as min_alt, MAX(altitude_ft) as max_alt,
-           AVG(altitude_ft) as avg_alt,
-           AVG(speed_kts) as avg_speed,
-           AVG(heading) as avg_heading,
-           COUNT(*) as sightings
+  // Get distinct hours that need compaction
+  const hoursToCompact = db.prepare(`
+    SELECT DISTINCT strftime('%Y-%m-%dT%H:00:00', poll_time) as hour
     FROM flights_seeding_alt
     WHERE poll_time < ?
-    GROUP BY hour, callsign
-  `).all(compactCutoff);
+    ORDER BY hour
+  `).all(compactCutoff).map(r => r.hour);
 
-  if (oldRows.length > 0) {
+  if (hoursToCompact.length > 0) {
+    console.log(`  Analyzing ${hoursToCompact.length} hours for preservation...`);
+
     const insertHourly = db.prepare(`
       INSERT OR REPLACE INTO flight_hourly_detail
         (hour, callsign, icao24, is_known_seeder, operator, aircraft_type,
@@ -275,21 +287,268 @@ async function collect() {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    const compactTx = db.transaction(() => {
-      for (const r of oldRows) {
-        insertHourly.run(
-          r.hour, r.callsign, r.icao24, r.is_known_seeder,
-          r.operator, r.aircraft_type,
-          r.min_lat, r.max_lat, r.min_lng, r.max_lng,
-          r.avg_lat, r.avg_lng,
-          r.min_alt, r.max_alt, r.avg_alt,
-          r.avg_speed, r.avg_heading, r.sightings,
-        );
+    const insertPreservedFlight = db.prepare(`
+      INSERT INTO preserved_flight_detail
+        (event_id, poll_time, icao24, callsign, lat, lng, altitude_ft,
+         speed_kts, heading, vertical_rate, squawk, is_known_seeder, operator, aircraft_type)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const insertEvent = db.prepare(`
+      INSERT INTO preservation_events
+        (hour, context_start, context_end, score,
+         known_seeder_present, loiter_callsigns, loiter_count,
+         cloud_delta_max, precip_onset, cluster_count,
+         total_aircraft_preserved, total_rows_preserved, reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    // Track which hours to preserve (including context windows)
+    const hoursToPreserve = new Set();
+    const eventsByHour = new Map(); // hour → event data
+
+    // ── PHASE 1: Score each hour ──────────────────────────────────────────
+
+    for (const hour of hoursToCompact) {
+      let score = 0;
+      const reasons = [];
+      let knownSeederPresent = 0;
+      let loiterCallsigns = [];
+      let cloudDeltaMax = 0;
+      let precipOnset = 0;
+      let clusterCount = 0;
+
+      // Get per-callsign stats for this hour
+      const callsignStats = db.prepare(`
+        SELECT callsign, icao24, is_known_seeder, operator, aircraft_type,
+               COUNT(*) as sightings,
+               MIN(lat) as min_lat, MAX(lat) as max_lat,
+               MIN(lng) as min_lng, MAX(lng) as max_lng,
+               AVG(lat) as avg_lat, AVG(lng) as avg_lng,
+               AVG(altitude_ft) as avg_alt, AVG(speed_kts) as avg_speed
+        FROM flights_seeding_alt
+        WHERE strftime('%Y-%m-%dT%H:00:00', poll_time) = ?
+        GROUP BY callsign
+      `).all(hour);
+
+      // Signal 1: Known seeder present
+      const seedersThisHour = callsignStats.filter(c => c.is_known_seeder);
+      if (seedersThisHour.length > 0) {
+        knownSeederPresent = seedersThisHour.length;
+        score += 40;
+        reasons.push(`${knownSeederPresent} known seeder(s): ${seedersThisHour.map(s => s.callsign).join(", ")}`);
       }
+
+      // Signal 2: Loiter pattern detection
+      // An aircraft that appears in ≥6 of ~12 polls/hour but with tiny geo spread
+      // is flying a racetrack pattern — the seeding signature.
+      // Commercial fly-throughs: 1-3 sightings, spread > 0.5°.
+      for (const cs of callsignStats) {
+        if (cs.sightings >= LOITER_MIN_SIGHTINGS) {
+          const spread = (cs.max_lat - cs.min_lat) + (cs.max_lng - cs.min_lng);
+          if (spread < LOITER_MAX_SPREAD && spread >= 0) {
+            // Additional check: must be at a reasonable speed (not parked/hovering)
+            // and at seeding altitude band (10k-25k is the sweet spot)
+            if (cs.avg_speed > 80 && cs.avg_alt >= 8000 && cs.avg_alt <= 28000) {
+              loiterCallsigns.push(cs.callsign);
+              score += 30;
+              reasons.push(`LOITER: ${cs.callsign} — ${cs.sightings} sightings, ${spread.toFixed(3)}° spread, ${Math.round(cs.avg_alt)} ft, ${Math.round(cs.avg_speed)} kts`);
+            }
+          }
+        }
+      }
+
+      // Signal 3: Weather correlation — check nearby grid points
+      // Look for cloud cover increase or precip onset vs previous hour
+      const prevHour = new Date(new Date(hour).getTime() - 3600000).toISOString().slice(0, 19);
+
+      // Get the geographic center of all flight activity this hour
+      const flightCenter = db.prepare(`
+        SELECT AVG(lat) as clat, AVG(lng) as clng
+        FROM flights_seeding_alt
+        WHERE strftime('%Y-%m-%dT%H:00:00', poll_time) = ?
+      `).get(hour);
+
+      if (flightCenter?.clat) {
+        const gridLat = Math.round(flightCenter.clat / 2) * 2;
+        const gridLng = Math.round(flightCenter.clng / 2) * 2;
+
+        // Check a 3x3 grid of points around the flight center
+        for (let dlat = -2; dlat <= 2; dlat += 2) {
+          for (let dlng = -2; dlng <= 2; dlng += 2) {
+            const wNow = db.prepare(`
+              SELECT cloud_cover, precip_rate FROM weather_grid
+              WHERE grid_lat = ? AND grid_lng = ? AND timestamp = ?
+            `).get(gridLat + dlat, gridLng + dlng, hour);
+
+            const wPrev = db.prepare(`
+              SELECT cloud_cover, precip_rate FROM weather_grid
+              WHERE grid_lat = ? AND grid_lng = ? AND timestamp = ?
+            `).get(gridLat + dlat, gridLng + dlng, prevHour);
+
+            if (wNow && wPrev) {
+              const delta = (wNow.cloud_cover || 0) - (wPrev.cloud_cover || 0);
+              if (delta > cloudDeltaMax) cloudDeltaMax = delta;
+
+              if ((wPrev.precip_rate || 0) === 0 && (wNow.precip_rate || 0) > 0) {
+                precipOnset = 1;
+              }
+            }
+          }
+        }
+
+        if (cloudDeltaMax > 20) {
+          score += 20;
+          reasons.push(`Cloud cover Δ+${cloudDeltaMax.toFixed(0)}% at nearby grid`);
+        }
+        if (precipOnset) {
+          score += 20;
+          reasons.push(`Precipitation onset at nearby grid point`);
+        }
+      }
+
+      // Signal 4: Cluster detection — multiple aircraft converging
+      // Group aircraft within 0.3° of each other
+      const seedingAltAircraft = callsignStats.filter(c => c.avg_alt >= 8000 && c.avg_alt <= 28000);
+      let clusters = 0;
+      const clustered = new Set();
+      for (let i = 0; i < seedingAltAircraft.length; i++) {
+        if (clustered.has(i)) continue;
+        let clusterSize = 1;
+        for (let j = i + 1; j < seedingAltAircraft.length; j++) {
+          if (clustered.has(j)) continue;
+          const dLat = Math.abs(seedingAltAircraft[i].avg_lat - seedingAltAircraft[j].avg_lat);
+          const dLng = Math.abs(seedingAltAircraft[i].avg_lng - seedingAltAircraft[j].avg_lng);
+          const dAlt = Math.abs(seedingAltAircraft[i].avg_alt - seedingAltAircraft[j].avg_alt);
+          if (dLat < 0.3 && dLng < 0.3 && dAlt < 5000) {
+            clustered.add(j);
+            clusterSize++;
+          }
+        }
+        if (clusterSize >= 3) {
+          clusters++;
+          clustered.add(i);
+        }
+      }
+      if (clusters > 0) {
+        clusterCount = clusters;
+        score += 10 * clusters;
+        reasons.push(`${clusters} aircraft cluster(s) at seeding altitude`);
+      }
+
+      // ── DECISION ──
+      if (score >= PRESERVE_THRESHOLD) {
+        // Mark this hour and its context window for preservation
+        const baseTime = new Date(hour).getTime();
+        for (let offset = -CONTEXT_HOURS_BEFORE; offset <= CONTEXT_HOURS_AFTER; offset++) {
+          const ctxHour = new Date(baseTime + offset * 3600000).toISOString().slice(0, 19);
+          hoursToPreserve.add(ctxHour);
+        }
+
+        eventsByHour.set(hour, {
+          score, reasons, knownSeederPresent,
+          loiterCallsigns, cloudDeltaMax, precipOnset, clusterCount,
+        });
+      }
+    }
+
+    // ── PHASE 2: Execute compaction + preservation ─────────────────────────
+
+    const compactTx = db.transaction(() => {
+      // First, handle preservation for flagged events
+      for (const [hour, evt] of eventsByHour) {
+        const baseTime = new Date(hour).getTime();
+        const ctxStart = new Date(baseTime - CONTEXT_HOURS_BEFORE * 3600000).toISOString().slice(0, 19);
+        const ctxEnd = new Date(baseTime + (CONTEXT_HOURS_AFTER + 1) * 3600000).toISOString().slice(0, 19);
+
+        // Count what we're preserving
+        const preserveRows = db.prepare(`
+          SELECT COUNT(*) as n, COUNT(DISTINCT callsign) as aircraft
+          FROM flights_seeding_alt
+          WHERE poll_time >= ? AND poll_time < ?
+        `).get(ctxStart, ctxEnd);
+
+        // Insert the event record
+        const result = insertEvent.run(
+          hour, ctxStart, ctxEnd, evt.score,
+          evt.knownSeederPresent,
+          evt.loiterCallsigns.join(","),
+          evt.loiterCallsigns.length,
+          evt.cloudDeltaMax,
+          evt.precipOnset,
+          evt.clusterCount,
+          preserveRows.aircraft || 0,
+          preserveRows.n || 0,
+          evt.reasons.join("; "),
+        );
+        const eventId = result.lastInsertRowid;
+
+        // Copy raw flight rows into preserved table
+        const rows = db.prepare(`
+          SELECT poll_time, icao24, callsign, lat, lng, altitude_ft,
+                 speed_kts, heading, vertical_rate, squawk,
+                 is_known_seeder, operator, aircraft_type
+          FROM flights_seeding_alt
+          WHERE poll_time >= ? AND poll_time < ?
+        `).all(ctxStart, ctxEnd);
+
+        for (const r of rows) {
+          insertPreservedFlight.run(
+            eventId, r.poll_time, r.icao24, r.callsign,
+            r.lat, r.lng, r.altitude_ft, r.speed_kts,
+            r.heading, r.vertical_rate, r.squawk,
+            r.is_known_seeder, r.operator, r.aircraft_type,
+          );
+        }
+      }
+
+      // Now compact ALL hours (summaries are always created, even for preserved hours)
+      for (const hour of hoursToCompact) {
+        const callsignRows = db.prepare(`
+          SELECT callsign, icao24, is_known_seeder, operator, aircraft_type,
+                 COUNT(*) as sightings,
+                 MIN(lat) as min_lat, MAX(lat) as max_lat,
+                 MIN(lng) as min_lng, MAX(lng) as max_lng,
+                 AVG(lat) as avg_lat, AVG(lng) as avg_lng,
+                 MIN(altitude_ft) as min_alt, MAX(altitude_ft) as max_alt,
+                 AVG(altitude_ft) as avg_alt,
+                 AVG(speed_kts) as avg_speed,
+                 AVG(heading) as avg_heading
+          FROM flights_seeding_alt
+          WHERE strftime('%Y-%m-%dT%H:00:00', poll_time) = ?
+          GROUP BY callsign
+        `).all(hour);
+
+        for (const r of callsignRows) {
+          insertHourly.run(
+            hour, r.callsign, r.icao24, r.is_known_seeder,
+            r.operator, r.aircraft_type,
+            r.min_lat, r.max_lat, r.min_lng, r.max_lng,
+            r.avg_lat, r.avg_lng,
+            r.min_alt, r.max_alt, r.avg_alt,
+            r.avg_speed, r.avg_heading, r.sightings,
+          );
+        }
+      }
+
+      // Delete all compacted raw rows (preserved ones are already copied)
       db.prepare("DELETE FROM flights_seeding_alt WHERE poll_time < ?").run(compactCutoff);
     });
     compactTx();
-    console.log(`  Compacted: ${oldRows.length} callsign-hours from older flight data`);
+
+    // Report
+    const preserved = eventsByHour.size;
+    const compacted = hoursToCompact.length - preserved;
+    console.log(`  Compacted: ${hoursToCompact.length} hours total`);
+    if (preserved > 0) {
+      console.log(`  ★ PRESERVED: ${preserved} event(s) with full flight detail:`);
+      for (const [hour, evt] of eventsByHour) {
+        console.log(`    → ${hour} (score ${evt.score}): ${evt.reasons[0]}`);
+      }
+      const totalPreservedRows = db.prepare("SELECT COUNT(*) as n FROM preserved_flight_detail").get().n;
+      console.log(`    Total preserved rows: ${totalPreservedRows}`);
+    }
+    console.log(`  Normal compaction: ${compacted} hours → hourly summaries`);
   }
 
   // ── Stats ──
@@ -299,12 +558,14 @@ async function collect() {
     flightHourly: db.prepare("SELECT COUNT(*) as n FROM flight_hourly_detail").get().n,
     seederTracks: db.prepare("SELECT COUNT(*) as n FROM seeder_tracks").get().n,
     trafficSummary: db.prepare("SELECT COUNT(*) as n FROM traffic_hourly_summary").get().n,
+    preservedRows: db.prepare("SELECT COUNT(*) as n FROM preserved_flight_detail").get().n,
+    preservedEvents: db.prepare("SELECT COUNT(*) as n FROM preservation_events").get().n,
   };
   const pageCount = db.pragma("page_count", { simple: true });
   const pageSize = db.pragma("page_size", { simple: true });
   const dbMB = ((pageCount * pageSize) / 1048576).toFixed(1);
 
-  console.log(`  DB size: ${dbMB} MB | weather: ${stats.weather} | flights(48h): ${stats.flightDetail} | compacted: ${stats.flightHourly} | seeders: ${stats.seederTracks} | traffic: ${stats.trafficSummary}`);
+  console.log(`  DB: ${dbMB} MB | weather: ${stats.weather} | flights(48h): ${stats.flightDetail} | compacted: ${stats.flightHourly} | seeders: ${stats.seederTracks} | preserved: ${stats.preservedRows} rows across ${stats.preservedEvents} events`);
 
   db.close();
   console.log(`[${new Date().toISOString()}] Done.\n`);

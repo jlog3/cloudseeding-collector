@@ -138,6 +138,75 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_fhd_seeder ON flight_hourly_detail(is_known_seeder, hour);
   CREATE INDEX IF NOT EXISTS idx_fhd_pos ON flight_hourly_detail(avg_lat, avg_lng);
   CREATE INDEX IF NOT EXISTS idx_traffic_hour ON traffic_hourly_summary(hour);
+
+  -- ═══════════════════════════════════════════════════════════════════════════
+  -- EVENT-TRIGGERED PRESERVATION
+  --
+  -- When the compaction step detects seeding-indicative patterns in an hour,
+  -- the full 5-minute-resolution flight data is preserved permanently instead
+  -- of being discarded. This is how you trace a specific aircraft responsible.
+  --
+  -- Detection signals:
+  --   • Loiter pattern: aircraft with ≥6 sightings/hr but <0.3° geo spread
+  --     (racetrack/orbit = seeding flight profile vs commercial fly-through)
+  --   • Known seeder callsign present at any altitude
+  --   • Weather correlation: cloud cover spike or precip onset at nearby grid
+  --   • Cluster: multiple seeding-alt aircraft converging in same area
+  --
+  -- A context window of ±2 hours is also preserved so analysts can see
+  -- what happened leading up to and following the event.
+  -- ═══════════════════════════════════════════════════════════════════════════
+
+  -- Full-resolution flight data for hours flagged by the correlation engine.
+  -- Same schema as flights_seeding_alt. KEPT FOREVER.
+  -- Typical size: ~50-200 MB/year (events are rare, but when they happen
+  -- you get every 5-minute position for every aircraft in the area).
+  CREATE TABLE IF NOT EXISTS preserved_flight_detail (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL,           -- links to preservation_events
+    poll_time TEXT NOT NULL,
+    icao24 TEXT,
+    callsign TEXT NOT NULL,
+    lat REAL NOT NULL,
+    lng REAL NOT NULL,
+    altitude_ft REAL,
+    speed_kts REAL,
+    heading REAL,
+    vertical_rate REAL,
+    squawk TEXT,
+    is_known_seeder INTEGER DEFAULT 0,
+    operator TEXT,
+    aircraft_type TEXT,
+    FOREIGN KEY (event_id) REFERENCES preservation_events(id)
+  );
+
+  -- Log of why each preservation was triggered.
+  CREATE TABLE IF NOT EXISTS preservation_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    detected_at TEXT DEFAULT (datetime('now')),
+    hour TEXT NOT NULL,                  -- the hour that triggered preservation
+    context_start TEXT NOT NULL,         -- earliest hour preserved (hour - 2h)
+    context_end TEXT NOT NULL,           -- latest hour preserved (hour + 1h)
+    score INTEGER NOT NULL,             -- composite signal score
+    -- Signal breakdown
+    known_seeder_present INTEGER DEFAULT 0,
+    loiter_callsigns TEXT,              -- comma-separated: aircraft flagged as loitering
+    loiter_count INTEGER DEFAULT 0,
+    cloud_delta_max REAL DEFAULT 0,     -- max cloud increase at nearby grid points
+    precip_onset INTEGER DEFAULT 0,     -- 1 if precip started at nearby grid points
+    cluster_count INTEGER DEFAULT 0,    -- number of converging aircraft groups
+    -- Summary
+    total_aircraft_preserved INTEGER DEFAULT 0,
+    total_rows_preserved INTEGER DEFAULT 0,
+    reason TEXT                          -- human-readable summary
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pfd_event ON preserved_flight_detail(event_id);
+  CREATE INDEX IF NOT EXISTS idx_pfd_poll ON preserved_flight_detail(poll_time);
+  CREATE INDEX IF NOT EXISTS idx_pfd_cs ON preserved_flight_detail(callsign);
+  CREATE INDEX IF NOT EXISTS idx_pfd_pos ON preserved_flight_detail(lat, lng);
+  CREATE INDEX IF NOT EXISTS idx_pe_hour ON preservation_events(hour);
+  CREATE INDEX IF NOT EXISTS idx_pe_score ON preservation_events(score);
 `);
 
 console.log(`Database ready at: ${DB_PATH}`);

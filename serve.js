@@ -147,6 +147,88 @@ app.get("/api/traffic", (req, res) => {
   res.json({ hours, entries: rows.length, data: rows });
 });
 
+// ─── GET /api/events?days=30 ────────────────────────────────────────────────
+// List all detected preservation events (seeding-indicative patterns).
+app.get("/api/events", (req, res) => {
+  const days = parseInt(req.query.days || "30");
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+
+  const rows = db.prepare(`
+    SELECT id, detected_at, hour, context_start, context_end, score,
+      known_seeder_present, loiter_callsigns, loiter_count,
+      cloud_delta_max, precip_onset, cluster_count,
+      total_aircraft_preserved, total_rows_preserved, reason
+    FROM preservation_events
+    WHERE detected_at >= ?
+    ORDER BY score DESC, detected_at DESC
+  `).all(cutoff);
+
+  res.json({ days, events: rows.length, data: rows });
+});
+
+// ─── GET /api/events/:id ────────────────────────────────────────────────────
+// Get full flight detail for a specific preserved event.
+app.get("/api/events/:id", (req, res) => {
+  const eventId = parseInt(req.params.id);
+  if (isNaN(eventId)) return res.status(400).json({ error: "Invalid event ID" });
+
+  const event = db.prepare(`
+    SELECT * FROM preservation_events WHERE id = ?
+  `).get(eventId);
+
+  if (!event) return res.status(404).json({ error: "Event not found" });
+
+  const flights = db.prepare(`
+    SELECT poll_time, icao24, callsign, lat, lng, altitude_ft,
+      speed_kts, heading, vertical_rate, squawk,
+      is_known_seeder, operator, aircraft_type
+    FROM preserved_flight_detail
+    WHERE event_id = ?
+    ORDER BY poll_time ASC, callsign
+  `).all(eventId);
+
+  // Group by callsign for per-aircraft tracks
+  const tracks = {};
+  for (const f of flights) {
+    if (!tracks[f.callsign]) {
+      tracks[f.callsign] = {
+        callsign: f.callsign,
+        icao24: f.icao24,
+        is_known_seeder: f.is_known_seeder,
+        operator: f.operator,
+        aircraft_type: f.aircraft_type,
+        positions: [],
+      };
+    }
+    tracks[f.callsign].positions.push({
+      time: f.poll_time,
+      lat: f.lat, lng: f.lng,
+      altitude_ft: f.altitude_ft,
+      speed_kts: f.speed_kts,
+      heading: f.heading,
+      vertical_rate: f.vertical_rate,
+    });
+  }
+
+  // Get weather for the event's time window at nearby grid points
+  const weather = db.prepare(`
+    SELECT timestamp, grid_lat, grid_lng, cloud_cover, cloud_cover_low,
+      cloud_cover_mid, cloud_cover_high, precip_rate, precip_prob,
+      humidity, temperature, wind_speed, wind_dir
+    FROM weather_grid
+    WHERE timestamp BETWEEN ? AND ?
+    ORDER BY timestamp, grid_lat, grid_lng
+  `).all(event.context_start, event.context_end);
+
+  res.json({
+    event,
+    flight_rows: flights.length,
+    unique_aircraft: Object.keys(tracks).length,
+    tracks: Object.values(tracks),
+    weather_context: weather,
+  });
+});
+
 // ─── GET /api/correlate?lat=39.87&lng=-75.31&hours=24 ──────────────────────
 // The key endpoint: returns weather + flight data aligned by hour for a location.
 // This is what the dashboard's correlation engine consumes.
@@ -219,6 +301,9 @@ app.get("/api/stats", (req, res) => {
     flight_hourly_rows: get("SELECT COUNT(*) as n FROM flight_hourly_detail").n,
     seeder_track_rows: get("SELECT COUNT(*) as n FROM seeder_tracks").n,
     traffic_summary_rows: get("SELECT COUNT(*) as n FROM traffic_hourly_summary").n,
+    preserved_flight_rows: get("SELECT COUNT(*) as n FROM preserved_flight_detail").n,
+    preservation_events: get("SELECT COUNT(*) as n FROM preservation_events").n,
+    highest_event_score: get("SELECT MAX(score) as n FROM preservation_events").n || 0,
     oldest_weather: get("SELECT MIN(timestamp) as t FROM weather_grid").t,
     newest_weather: get("SELECT MAX(timestamp) as t FROM weather_grid").t,
     oldest_flight: get("SELECT MIN(poll_time) as t FROM flights_seeding_alt").t,
@@ -235,6 +320,8 @@ app.listen(PORT, () => {
   console.log(`  GET /api/flights?lat=39.87&lng=-75.31&hours=48    ← recent detail`);
   console.log(`  GET /api/flights/history?lat=39.87&lng=-75.31&days=30`);
   console.log(`  GET /api/weather?lat=39.87&lng=-75.31&hours=24`);
+  console.log(`  GET /api/events?days=30                           ← preserved seeding events`);
+  console.log(`  GET /api/events/:id                               ← full flight tracks for event`);
   console.log(`  GET /api/seeders?hours=168`);
   console.log(`  GET /api/traffic?hours=168`);
   console.log(`  GET /api/stats`);
