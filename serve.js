@@ -28,7 +28,8 @@ app.get("/api/weather", (req, res) => {
   // Snap to nearest grid point
   const gridLat = Math.round(lat / 2) * 2;
   const gridLng = Math.round(lng / 2) * 2;
-  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+  // Hour-keyed cutoff to match canonical timestamp format (no trailing Z).
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString().slice(0, 13) + ":00:00";
 
   const rows = db.prepare(`
     SELECT timestamp, temperature, humidity, wind_speed, wind_dir,
@@ -92,7 +93,7 @@ app.get("/api/flights/history", (req, res) => {
   const days = parseInt(req.query.days || "7");
   if (isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: "lat and lng required" });
 
-  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 13) + ":00:00";
 
   const rows = db.prepare(`
     SELECT hour, callsign, icao24, is_known_seeder, operator, aircraft_type,
@@ -235,12 +236,17 @@ app.get("/api/events/:id", (req, res) => {
 app.get("/api/correlate", (req, res) => {
   const lat = parseFloat(req.query.lat);
   const lng = parseFloat(req.query.lng);
+  const radius = parseFloat(req.query.radius || "2"); // degrees, now honored
   const hours = parseInt(req.query.hours || "24");
   if (isNaN(lat) || isNaN(lng)) return res.status(400).json({ error: "lat and lng required" });
 
   const gridLat = Math.round(lat / 2) * 2;
   const gridLng = Math.round(lng / 2) * 2;
-  const cutoff = new Date(Date.now() - hours * 3600000).toISOString();
+  // Hour-keyed cutoff matching the canonical timestamp/hour format
+  // ("YYYY-MM-DDTHH:00:00", UTC, no trailing Z) used by weather_grid.timestamp
+  // and flight_hourly_detail.hour. A full-ISO cutoff with a "Z" suffix sorts
+  // lexically AFTER the bare hour key, which would wrongly drop the boundary hour.
+  const cutoff = new Date(Date.now() - hours * 3600000).toISOString().slice(0, 13) + ":00:00";
 
   // Weather by hour
   const weather = db.prepare(`
@@ -259,7 +265,7 @@ app.get("/api/correlate", (req, res) => {
     WHERE avg_lat BETWEEN ? AND ? AND avg_lng BETWEEN ? AND ?
       AND hour >= ?
     ORDER BY hour
-  `).all(lat - 2, lat + 2, lng - 2, lng + 2, cutoff);
+  `).all(lat - radius, lat + radius, lng - radius, lng + radius, cutoff);
 
   // Group flights by hour
   const flightsByHour = {};
