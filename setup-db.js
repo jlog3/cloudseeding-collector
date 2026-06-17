@@ -187,6 +187,9 @@ db.exec(`
     hour TEXT NOT NULL,                  -- the hour that triggered preservation
     context_start TEXT NOT NULL,         -- earliest hour preserved (hour - 2h)
     context_end TEXT NOT NULL,           -- latest hour preserved (hour + 1h)
+    center_lat REAL,                     -- event location (centroid of loiters)
+    center_lng REAL,                     -- used to bound preservation geographically
+    radius_deg REAL DEFAULT 1.0,         -- preservation box half-width in degrees
     score INTEGER NOT NULL,             -- composite signal score
     -- Signal breakdown
     known_seeder_present INTEGER DEFAULT 0,
@@ -207,6 +210,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pfd_pos ON preserved_flight_detail(lat, lng);
   CREATE INDEX IF NOT EXISTS idx_pe_hour ON preservation_events(hour);
   CREATE INDEX IF NOT EXISTS idx_pe_score ON preservation_events(score);
+  -- Guards that prevent the duplication/re-preservation bug from recurring
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_pe_hour ON preservation_events(hour);
+  CREATE UNIQUE INDEX IF NOT EXISTS uq_pfd_logical
+    ON preserved_flight_detail(event_id, poll_time, icao24, callsign);
 `);
 
 console.log(`Database ready at: ${DB_PATH}`);
