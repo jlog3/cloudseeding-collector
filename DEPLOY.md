@@ -1,171 +1,157 @@
-# Deployment Guide
+# Deployment Guide (v2)
 
-Your code lives on GitHub. The collector needs to run somewhere 24/7.
-Pick whichever option fits your situation.
+Your code lives on GitHub; the collector runs somewhere 24/7. The deploy
+mechanics are unchanged from v1 — the only additions are a few environment
+variables and a one-time registry build. Pick whichever host fits.
 
-## Option 1: Railway.app (easiest, free tier)
+> **Environment variables (all hosts).** Beyond `DB_PATH`/`PORT`, v2 adds:
+> ```
+> OPENSKY_CLIENT_ID=...        # OAuth2 client — strongly recommended (stops 429s)
+> OPENSKY_CLIENT_SECRET=...
+> OBSERVATION_SOURCE=openmeteo # or mrms / goes (needs OBSERVATION_SIDECAR_URL)
+> ```
+> Create an OpenSky API client at https://opensky-network.org/ (account → API
+> clients). See `.env.example` for the full list.
 
-Railway gives you a persistent process + a public URL for the API.
-Both the collector and API server run in a single service (Railway
-doesn't support shared volumes between services).
+> **One-time after first deploy: build the seeder registry.**
+> ```
+> node fetch-faa-seeders.js
+> ```
+> Run it in the deployed environment (or locally, then commit `data/seeders.json`).
+> Re-run monthly. Without it, the icao24 known-seeder matcher is empty.
+
+> **Upgrading an existing v1 deployment.** `setup-db.js` migrates the schema in
+> place (adds the new tables/columns). Then optionally clear the old false
+> positives so the new detector rebuilds cleanly:
+> ```
+> node reset-preservation.js     # wipes derived tables only; raw data is kept
+> ```
+
+---
+
+## Option 1: Railway.app (easiest)
+
+Both collector and API run in one service (Railway has no shared volumes).
 
 ```bash
-# Install Railway CLI
 npm install -g @railway/cli
-
-# Login
 railway login
-
-# From inside the cloned repo:
 railway init
 railway up
 ```
 
-Railway auto-detects the Dockerfile, builds it, runs `start.js` which
-launches both the collector loop and the API server in one process.
+Railway auto-detects the Dockerfile and runs `start.js`.
 
 **After deploy:**
-
-1. Add a **volume**: press `Cmd+K` (or `Ctrl+K`), type "volume",
-   select your service, set mount path to `/app/data`
-2. Add **environment variables** in the Variables tab:
+1. Add a **volume** (Cmd/Ctrl+K → "volume"), mount path `/app/data`.
+2. **Variables** tab:
    ```
    DB_PATH=/app/data/cloudseeding.db
    PORT=4000
    COLLECT_INTERVAL_MS=300000
+   OPENSKY_CLIENT_ID=...
+   OPENSKY_CLIENT_SECRET=...
+   OBSERVATION_SOURCE=openmeteo
    ```
-3. Under **Settings → Networking**, click **"Generate Domain"**
-   to get a public URL for the API
-4. Redeploy after adding the volume
+3. **Settings → Networking → Generate Domain** for the public API URL.
+4. Redeploy after adding the volume.
+5. One-time: open a shell (`railway run node fetch-faa-seeders.js`) to build the registry.
 
-**Cost:** Hobby plan is $5/month with $5 included credit. This collector
-uses ~$1-2/month of resources — fits within the free credit.
+**Cost:** Hobby plan ~$5/mo with $5 credit; this uses ~$1–2/mo.
 
+---
 
-## Option 2: Render.com (free background worker)
+## Option 2: Render.com
 
-1. Go to https://render.com, sign in with GitHub
-2. Click "New" → "Web Service" (not background worker — we need the port)
-3. Connect your `cloudseeding-collector` repo
-4. Build command: `npm install`
-5. Start command: `node start.js`
-6. Environment: set `DB_PATH=/data/cloudseeding.db` and `PORT=4000`
-7. Add a Disk: mount path `/data`, size 1 GB
+1. New → **Web Service**, connect the repo.
+2. Build: `npm install` · Start: `node start.js`.
+3. Env: `DB_PATH=/data/cloudseeding.db`, `PORT=4000`, OpenSky creds.
+4. Add a **Disk** mounted at `/data` (1 GB).
+5. Shell once: `node fetch-faa-seeders.js`.
 
-This runs both the collector and API server. You get a public URL automatically.
+---
 
-**Cost:** Free tier works. Add the disk ($0.25/month for 1 GB).
-
-
-## Option 3: Fly.io (persistent volume, global edge)
+## Option 3: Fly.io
 
 ```bash
-# Install flyctl
 curl -L https://fly.io/install.sh | sh
-
-# From inside the repo:
-fly launch           # creates fly.toml
+fly launch
 fly volumes create cloudseeding_data --size 1
 fly deploy
 ```
 
-Edit `fly.toml` to mount the volume and expose the API port:
+`fly.toml`:
 ```toml
 [mounts]
   source = "cloudseeding_data"
   destination = "/data"
-
 [env]
   DB_PATH = "/data/cloudseeding.db"
   PORT = "4000"
-
+  OBSERVATION_SOURCE = "openmeteo"
 [[services]]
   internal_port = 4000
 ```
+Set OpenSky secrets with `fly secrets set OPENSKY_CLIENT_ID=... OPENSKY_CLIENT_SECRET=...`.
+Then `fly ssh console -C "node fetch-faa-seeders.js"`.
 
-**Cost:** Free tier covers 1 machine with 256MB RAM. Plenty.
+---
 
-
-## Option 4: Any $4-5/month VPS
-
-DigitalOcean, Vultr, Hetzner, Linode — any Linux box works.
+## Option 4: Any $4–5/mo VPS
 
 ```bash
-# SSH in, clone, install, run
-ssh root@your-server
-
 git clone https://github.com/YOUR_USER/cloudseeding-collector.git
 cd cloudseeding-collector
 npm install
+cp .env.example .env && nano .env        # add OpenSky creds
 node setup-db.js
-
-# Run with pm2 (process manager) — single process handles both
+node fetch-faa-seeders.js
 npm install -g pm2
-pm2 start start.js --name cloudseeding
-pm2 save
-pm2 startup  # auto-start on reboot
-```
-
-**Cost:** $4-5/month. Most reliable option. Full control.
-
-
-## Option 5: Docker Compose (on any host)
-
-If your host has Docker:
-
-```bash
-git clone https://github.com/YOUR_USER/cloudseeding-collector.git
-cd cloudseeding-collector
-docker compose up -d
-```
-
-This starts both the collector and API server in one container. Data persists in a Docker volume.
-
-```bash
-docker compose logs -f    # watch both collector + API output
-```
-
-
-## Option 6: Raspberry Pi at home
-
-```bash
-# On the Pi
-git clone https://github.com/YOUR_USER/cloudseeding-collector.git
-cd cloudseeding-collector
-npm install
-node setup-db.js
 pm2 start start.js --name cloudseeding
 pm2 save && pm2 startup
 ```
 
-The DB writes to the SD card (or better, an external USB drive).
-Use a service like ngrok or Cloudflare Tunnel to expose the API publicly.
+On a plain VM you can use cron instead of the in-process loop — see
+`crontab.sample` (collect every 5 min, monitor+vacuum daily, aggregate daily).
 
-**Cost:** Free if you have a Pi. Uses ~50MB RAM.
+---
 
+## Option 5: Docker Compose
+
+```bash
+cp .env.example .env       # docker-compose.yml reads OPENSKY_* / OBSERVATION_SOURCE
+docker compose up -d
+docker compose exec cloudseeding node fetch-faa-seeders.js
+docker compose logs -f
+```
+
+---
+
+## Optional: real-observation sidecar (mrms / goes)
+
+To swap the model "actual" for real radar/satellite, run a small HTTP service
+that parses NOAA products and returns normalized cells, then set:
+```
+OBSERVATION_SOURCE=mrms          # or goes
+OBSERVATION_SIDECAR_URL=http://sidecar:8080
+```
+The sidecar must answer `GET /observations?hour=&kind=&latMin=&latMax=&lngMin=&lngMax=`
+with `{ "cells": [ { lat, lng, cloud_cover, cloud_top_temp_c, precip_rate, ... } ] }`.
+If it's unreachable the collector automatically falls back to the model grid and
+flags the cycle as degraded — the pipeline never goes dark.
+
+---
 
 ## After deployment
 
-1. Verify it's collecting: visit `http://YOUR_HOST:4000/api/stats`
-2. You should see row counts increasing every 5 minutes
-3. Update your dashboard's `.env`:
-   ```
-   NEXT_PUBLIC_COLLECTOR_API=https://your-collector-api.example.com
-   ```
-4. The Data Explorer in the dashboard will now query your live data
+1. Check `https://YOUR_HOST/api/stats` — row counts should climb every 5 min.
+2. Watch `https://YOUR_HOST/api/airframes` after data accumulates (days/weeks).
+3. Point the website at it: `NEXT_PUBLIC_COLLECTOR_API=https://your-collector...`.
 
+## Backups
 
-## Backing up the database
-
-The entire dataset is one file: `cloudseeding.db`. Back it up however you want:
-
+The dataset is one file:
 ```bash
-# Simple: copy it periodically
 cp cloudseeding.db cloudseeding-backup-$(date +%Y%m%d).db
-
-# On a VPS with cron:
-0 4 * * * cp /path/to/cloudseeding.db /backups/cloudseeding-$(date +\%Y\%m\%d).db
-
-# Or sync to cloud storage:
-0 4 * * * rclone copy /path/to/cloudseeding.db r2:my-bucket/backups/
+# or: rclone copy cloudseeding.db r2:my-bucket/backups/
 ```

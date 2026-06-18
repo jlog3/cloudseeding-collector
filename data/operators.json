@@ -1,0 +1,26 @@
+{
+  "_comment": "Operator NAME PATTERNS matched (case-insensitive substring) against the FAA registry's registered-owner NAME field by fetch-faa-seeders.js. These are real, public weather-modification operators/agencies. Add any operator named in NOAA weather-modification activity reports (filed under 15 U.S.C. 330, archived by NOAA NCEI). 'pinnedAircraft' lets you hard-add specific airframes by icao24 (preferred) or registration (N-number) — e.g. a tail number named in a report that the FAA owner field doesn't catch. Leave pinnedAircraft empty unless you have a verified source.",
+  "operatorPatterns": [
+    "WEATHER MODIFICATION",
+    "NORTH AMERICAN WEATHER",
+    "WESTERN WEATHER",
+    "ICE CRYSTAL ENGINEERING",
+    "SEEDING OPERATIONS",
+    "SOAR ",
+    "RHS CONSULTING",
+    "DESERT RESEARCH INSTITUTE",
+    "WEATHER MOD",
+    "CLOUD SEED",
+    "RAINMAKER",
+    "ATMOSPHERIC RESEARCH",
+    "TASC ",
+    "WEATHER ENHANCEMENT"
+  ],
+  "pinnedAircraft": [],
+  "_pinnedAircraftExample": {
+    "icao24": "a1b2c3",
+    "registration": "N350WM",
+    "operator": "Example Weather Mod Co",
+    "type": "Cessna 340"
+  }
+}

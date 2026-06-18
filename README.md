@@ -1,20 +1,46 @@
-# cloudseeding-collector
+# cloudseeding-collector (v2)
 
-Standalone data collector for the [CloudSeeding Transparency](https://github.com/YOUR_USERNAME/cloudseeding-transparency) project. Polls real-time flight tracking and weather data across the entire continental US, stores it in a local SQLite database for historical correlation analysis.
+CONUS-wide flight + weather collector with a **layered, wind-coupled, observation-aware** detector for cloud-seeding aircraft, and an **aggregate "repeat offender" test** that surfaces airframes appearing upwind of suspicious weather far more often than their flight volume can explain.
 
-**Runs independently of the dashboard.** Start collecting now, analyze later.
+Runs independently of the website. Collect now, analyze continuously.
 
-## What it does
+---
 
-Every 5 minutes:
+## What changed from v1 (and why)
 
-1. **Pulls every aircraft over the continental US** from the [OpenSky Network](https://opensky-network.org/) ADS-B API — one call, ~5,000-7,000 aircraft
-2. **Stores full detail for seeding-altitude aircraft** (5,000–30,000 ft) — callsign, exact position, altitude, speed, heading, vertical rate
-3. **Permanently tracks known seeder aircraft** (Weather Modification Inc fleet, etc.) at any altitude
-4. **Queries weather for a 2° grid** (~195 points) across CONUS from [Open-Meteo](https://open-meteo.com/) — cloud cover, precipitation, humidity, wind, pressure
-5. **Compacts older flight data** into per-callsign hourly summaries after 48 hours
+The v1 detector was **aircraft-first**: find loitering planes, then look for nearby weather. On national air traffic that produced almost pure noise (every one of its 1,577 "events" was a false positive; zero involved a real known seeder). v2 inverts and layers the logic, and fixes the data pipeline that was failing.
 
-The result is a single `cloudseeding.db` file that grows ~2 GB/year and contains everything needed to answer: *"Which aircraft were at seeding altitude near this location in the hours before cloud cover changed?"*
+| Area | v1 | v2 |
+|---|---|---|
+| **Identity** | callsign (mutable, spoofable) | **icao24** (stable per airframe), matched against a real registry |
+| **Detection** | loiter → nearby weather | **anomaly-first → backtrack UPWIND along the wind → score aircraft** |
+| **Baseline** | "forecast said dry but it rained" (mostly forecast error) | **persisted forward forecasts**, then *actual vs what-was-predicted-hours-ago* — a real counterfactual |
+| **Seedability** | none | **gate**: an anomaly only counts if the cloud could plausibly hold supercooled liquid water |
+| **Flights** | anonymous OpenSky (429s, "fetch failed") | **OpenSky OAuth2** + `airplanes.live` fallback |
+| **Weather** | ~420 sequential Open-Meteo calls/sweep | **batched** multi-point requests |
+| **Proof model** | single events | **aggregation with a permutation null + FDR** — repetition is the signal |
+
+> **Honest framing.** Detecting a seeding *effect* from a single event is effectively impossible — documented effects are single-digit-percent precipitation changes, well inside natural variability. This tool does **not** claim to prove seeding. It surfaces **candidates worth a human look**: aircraft whose flight patterns + wind-coupling + repetition stand out from chance.
+
+---
+
+## The pipeline
+
+Every 5 minutes (`collect.js`):
+
+1. **Ingest flights** (`sources/flights.js`) CONUS-wide, normalized to icao24. OpenSky OAuth2 → anonymous → `airplanes.live` (free, *unfiltered* — it shows airframes that suppress themselves from FAA feeds, exactly the population of interest).
+2. **Classify** each airframe against the **seeder_registry** (`seeders.js`) by icao24.
+3. **Store** the seeding-band aircraft (rolling 48 h full-resolution) + known seeders forever.
+4. **Ingest weather** (`sources/weather.js`): the current grid **and** the forward forecast for the next 12 h (persisted → the baseline).
+5. **Analyze** (`analysis.js`):
+   - **Layer 1 — anomalies.** Cells where observed cloud/precip exceeded the *earliest* forecast for that hour (or, during warm-up, hour-over-hour persistence). Adjacent cells are clustered; each cluster's **linear structure** (a seeding line vs a blob) and **seedability** are measured.
+   - **Layer 2 — candidates.** For each anomaly, project **upwind** using the local wind across plausible lags (0.5–3 h) and score aircraft that were there before it: track geometry (racetrack/orbit, straight pass), altitude band, speed, **wind-coupling distance**, and **perpendicularity to wind** (seeding legs run across the wind).
+   - **Layer 3 — persistence.** Every candidate is written to `anomaly_candidates` (not just preserved events) so the aggregate test has data.
+   - Strong, seedable, well-coupled hours are **preserved** at full resolution; everything else is compacted to hourly summaries.
+
+Daily (`run-aggregate.js`): rebuild the **airframe ranking** (`aggregate.js`) — for each airframe, how many seedable anomalies it was a strong candidate for vs. what its flight volume predicts, via a flight-volume-weighted **permutation null** with **Benjamini–Hochberg FDR** correction.
+
+---
 
 ## Quick start
 
@@ -22,164 +48,107 @@ The result is a single `cloudseeding.db` file that grows ~2 GB/year and contains
 git clone https://github.com/YOUR_USERNAME/cloudseeding-collector.git
 cd cloudseeding-collector
 npm install
-node setup-db.js      # create the database
-node collect.js       # run one collection cycle
+cp .env.example .env          # add OpenSky credentials (recommended)
+node setup-db.js              # create / migrate the database
+node fetch-faa-seeders.js     # build the known-seeder registry (see below)
+node collect.js               # run one cycle
+node collect-loop.js          # or run continuously
 ```
 
-## Running continuously
+### Build the known-seeder registry
 
-### Option A: Loop process (simplest)
+`seeders.js` matches live aircraft by icao24, so the registry must be populated:
 
 ```bash
-# Foreground
-node collect-loop.js
-
-# Background
-nohup node collect-loop.js >> collector.log 2>&1 &
-
-# With pm2
-pm2 start collect-loop.js --name cloudseeding-collector
+node fetch-faa-seeders.js
 ```
 
-### Option B: Cron
+This downloads the public **FAA Releasable Aircraft Database**, keeps rows whose registered owner matches a weather-modification operator pattern (edit `data/operators.json` — add operators named in NOAA weather-modification reports filed under 15 U.S.C. §330), reads the **Mode S / ICAO hex directly** from the FAA data, and writes them into `seeder_registry` + `data/seeders.json`. Re-run monthly. (If your host can't reach `registry.faa.gov`, download the zip in a browser and run `node fetch-faa-seeders.js ./ReleasableAircraft.zip`.)
 
-```bash
-# Every 5 minutes
-*/5 * * * * cd /path/to/cloudseeding-collector && node collect.js >> collector.log 2>&1
-```
-
-### Option C: Docker
-
-```bash
-docker compose up -d    # starts collector + API server
-```
+---
 
 ## API server
 
-The API server is a read-only REST interface over the database. The dashboard queries it to hydrate historical data.
+Read-only REST over the database. **All v1 endpoints are unchanged** (the website keeps working); new ones expose the layered output.
 
 ```bash
-node serve.js           # default port 4000
-PORT=8080 node serve.js # custom port
+node serve.js                 # default port 4000
 ```
-
-### Key endpoints
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/correlate?lat=39.87&lng=-75.31&hours=24` | **Primary** — weather + flight data aligned by hour |
-| `GET /api/flights?lat=39.87&lng=-75.31&hours=48` | Recent flight detail (seeding altitude, 48h window) |
-| `GET /api/flights/history?lat=39.87&lng=-75.31&days=30` | Compacted hourly flight data for long-term analysis |
-| `GET /api/weather?lat=39.87&lng=-75.31&hours=24` | Hourly weather from nearest grid point |
-| `GET /api/seeders?hours=168` | All known seeder positions (permanent, full detail) |
-| `GET /api/traffic?hours=168` | CONUS-wide hourly traffic totals by altitude band |
-| `GET /api/stats` | Database size, row counts, date ranges |
+| `GET /api/correlate?lat=&lng=&hours=24` | **(v1)** weather + per-hour flight counts — the dashboard uses this |
+| `GET /api/flights?lat=&lng=&hours=48` | **(v1)** recent seeding-band detail |
+| `GET /api/flights/history?lat=&lng=&days=30` | **(v1)** compacted hourly flight data |
+| `GET /api/weather` · `/api/seeders` · `/api/traffic` · `/api/events` · `/api/events/:id` · `/api/stats` | **(v1)** unchanged |
+| `GET /api/anomalies?days=30&seedable=0.4` | **(new)** forecast-exceedance anomalies (optionally seedable-gated, geo-boxed) |
+| `GET /api/anomalies/:id` | **(new)** one anomaly + its ranked candidate aircraft |
+| `GET /api/candidates?icao24=ab1234` | **(new)** an airframe's wind-coupling history (or top recent) |
+| `GET /api/airframes?significant=1` | **(new, headline)** the repeat-offender ranking |
+| `GET /api/seeders/registry` | **(new)** the icao24-keyed known-seeder list |
 
-## Data architecture
+`/api/airframes` is the one to watch: airframes sorted by **associations beyond flight-volume expectation**. `significant=1` filters to those passing the FDR threshold.
 
-### What gets stored (and why)
+---
 
-```
-┌──────────────────────┬───────────────┬─────────────────────────────────────┐
-│ Table                │ Retention     │ Why                                 │
-├──────────────────────┼───────────────┼─────────────────────────────────────┤
-│ weather_grid         │ Forever       │ Cloud/precip data for correlation   │
-│ seeder_tracks        │ Forever       │ Every known seeder position ever    │
-│ flight_hourly_detail │ Forever       │ Per-callsign hourly positions —     │
-│                      │               │ the unknown-seeder detection pool   │
-│ traffic_hourly_summary│ Forever      │ CONUS-wide traffic by altitude band │
-│ flights_seeding_alt  │ 48h rolling   │ Full detail for recent analysis     │
-└──────────────────────┴───────────────┴─────────────────────────────────────┘
-```
+## Real observations vs. model data (important)
 
-### Altitude filtering
+The anomaly detector asks one question — *"what were the actual conditions this hour?"* — through a pluggable adapter (`sources/observations.js`):
 
-| Band | Range | Storage | Rationale |
-|---|---|---|---|
-| **Seeding altitude** | 5,000–30,000 ft | Full detail | Cloud seeding ops happen here |
-| High altitude | >30,000 ft | Count only | Commercial cruisers, not seeding |
-| Low altitude | <5,000 ft | Count only | Departures/arrivals, not seeding |
-| Known seeders | Any altitude | **Full detail, forever** | Always track these |
+- **`OBSERVATION_SOURCE=openmeteo` (default, fully runnable):** uses the Open-Meteo grid. This is a **forecast model's best estimate, not observation.** It works out of the box and makes the whole pipeline run, but the "actual" side is still model data, which limits anomaly fidelity.
+- **`OBSERVATION_SOURCE=mrms` / `goes` (recommended upgrade):** real radar (MRMS QPE) / satellite (GOES ABI cloud-top temperature). These are GRIB2/NetCDF formats that need the scientific Python stack, which doesn't belong in this Node service — so they're served by a small **HTTP sidecar** at `OBSERVATION_SIDECAR_URL` returning the same normalized cells. The analysis, coupling, and aggregation code is unchanged; it's a config flip once the sidecar is up. (GOES cloud-top temperature also makes the **seedability gate** far sharper — with model data it falls back to a documented proxy from freezing level + cloud + humidity.)
 
-### Storage estimates
+---
 
-| Timeframe | Database size |
-|---|---|
-| 1 day | ~55 MB peak (pre-compaction) |
-| 1 week | ~150 MB |
-| 1 month | ~300 MB |
-| 1 year | ~2 GB |
-| 5 years | ~10 GB |
+## Warm-up & limitations (read before trusting output)
 
-## Schema
+- **Baseline warm-up.** The forecast counterfactual needs a few hours of persisted forecasts before it engages; until then anomalies use hour-over-hour persistence (noisier).
+- **Aggregate power.** The repeat-offender test has little power until *many* seedable anomalies accumulate (weeks). Early rankings are indicative, not conclusive.
+- **Candidates, not conclusions.** Atmospheric-research, survey, pipeline-patrol, and traffic aircraft can rank high and must be ruled out by a human. A high rank is a *reason to look*, nothing more.
+- **Coarse grid.** The 2° weather grid is a synoptic baseline only; real plume-scale structure needs the observation sidecar.
+- **Model wind.** Upwind backtracking uses model wind; good enough for ~tens-of-km advection over a few hours, not exact.
 
-```
-weather_grid                         ← CONUS 2° grid, kept forever
-├── grid_lat, grid_lng, timestamp
-├── temperature, humidity, dewpoint
-├── wind_speed, wind_dir
-├── precip_rate, precip_prob
-├── cloud_cover, cloud_cover_low, cloud_cover_mid, cloud_cover_high
-├── pressure, visibility
-
-flights_seeding_alt                  ← 48h rolling detail
-├── poll_time, icao24, callsign
-├── lat, lng, altitude_ft, speed_kts, heading, vertical_rate
-├── squawk, is_known_seeder, operator, aircraft_type
-
-seeder_tracks                        ← permanent, full resolution
-├── poll_time, icao24, callsign
-├── lat, lng, altitude_ft, speed_kts, heading, vertical_rate
-├── squawk, operator, aircraft_type
-
-flight_hourly_detail                 ← compacted from flights_seeding_alt, kept forever
-├── hour, callsign, icao24
-├── is_known_seeder, operator, aircraft_type
-├── position envelope: min/max/avg lat, lng
-├── altitude envelope: min/max/avg alt
-├── avg_speed_kts, avg_heading, sightings
-
-traffic_hourly_summary               ← CONUS-wide counts per hour
-├── hour
-├── total_aircraft, seeding_alt_aircraft, high_alt_aircraft, low_alt_aircraft
-├── known_seeder_count, known_seeder_callsigns
-```
-
-## Future: unknown seeder detection
-
-The `flight_hourly_detail` table is designed for this. Once you have weeks/months of data, the analysis query is:
-
-```sql
--- Find aircraft that were at seeding altitude near a location
--- in the 1-4 hours before a significant cloud cover increase
-SELECT fhd.callsign, fhd.hour, fhd.avg_alt_ft, fhd.avg_lat, fhd.avg_lng,
-       w1.cloud_cover as cloud_before, w2.cloud_cover as cloud_after
-FROM flight_hourly_detail fhd
-JOIN weather_grid w1 ON w1.timestamp = fhd.hour
-  AND ABS(w1.grid_lat - fhd.avg_lat) < 2
-  AND ABS(w1.grid_lng - fhd.avg_lng) < 2
-JOIN weather_grid w2 ON w2.timestamp = datetime(fhd.hour, '+3 hours')
-  AND w2.grid_lat = w1.grid_lat AND w2.grid_lng = w1.grid_lng
-WHERE w2.cloud_cover - w1.cloud_cover > 25    -- significant increase
-  AND fhd.avg_alt_ft BETWEEN 5000 AND 30000
-ORDER BY (w2.cloud_cover - w1.cloud_cover) DESC;
-```
-
-Aircraft that repeatedly appear in this result set across many events are strong candidates for previously unknown cloud seeding operations.
+---
 
 ## Configuration
 
-| Environment variable | Default | Description |
+Everything is in `config.js`, overridable via env (see `.env.example`). Highlights:
+
+| Variable | Default | Description |
 |---|---|---|
-| `DB_PATH` | `./cloudseeding.db` | Path to SQLite database file |
-| `PORT` | `4000` | API server port |
-| `COLLECT_INTERVAL_MS` | `300000` | Collection loop interval (5 min) |
+| `DB_PATH` | `./cloudseeding.db` | SQLite file (Railway: the mounted volume) |
+| `OPENSKY_CLIENT_ID` / `_SECRET` | — | OAuth2 creds; **set these to stop the 429s** |
+| `OBSERVATION_SOURCE` | `openmeteo` | `openmeteo` \| `mrms` \| `goes` |
+| `OBSERVATION_SIDECAR_URL` | — | sidecar for `mrms`/`goes` |
+| `SEED_ALT_MIN` / `_MAX` | `5000` / `14000` | altitude band the analysis trusts |
+| `FORECAST_HORIZON_HOURS` | `12` | how far ahead forecasts are persisted |
+| `AGGREGATE_PERMUTATIONS` | `500` | permutation null iterations |
+| `AGGREGATE_FDR_ALPHA` | `0.1` | FDR significance threshold |
+| `COLLECT_INTERVAL_MS` | `300000` | collection cadence |
+
+---
+
+## Maintenance & schema
+
+- `node monitor.js [--vacuum]` — storage vitals + in-place page reclaim (safe under a tight volume cap; avoids a full VACUUM's ~2× scratch need). The loop runs this + the aggregate daily.
+- `node reset-preservation.js` — wipe **derived** tables (events + anomalies + candidates + airframe scores) to let the new detector rebuild; raw inputs and the registry are untouched.
+- The schema lives in one place (`schema.js`); `setup-db.js` and the reset script compose from it, so create/reset can't drift. New databases set `auto_vacuum=INCREMENTAL`; existing ones are migrated (e.g. `weather_grid.freezing_level_m` is added in place).
+
+```
+RAW (48h rolling):     flights_seeding_alt
+FOREVER:               weather_grid, weather_forecast, seeder_tracks,
+                       flight_hourly_detail, traffic_hourly_summary, seeder_registry
+DERIVED (rebuildable): weather_anomalies, anomaly_candidates,
+                       preservation_events, preserved_flight_detail, airframe_scores
+```
+
+---
 
 ## Data sources & attribution
 
-- **Flight data**: [OpenSky Network](https://opensky-network.org/) — free ADS-B data, cite: *Schäfer et al., "Bringing Up OpenSky: A Large-scale ADS-B Sensor Network for Research," IPSN 2014*
-- **Weather data**: [Open-Meteo](https://open-meteo.com/) — free weather API, CC BY 4.0
-- **Seeding zones**: [NOAA Weather Modification Activity Reports](https://www.weather.gov/media/slc/ClimateNarrative/WMA/WMA.pdf)
+- **Flights:** [OpenSky Network](https://opensky-network.org/) (*Schäfer et al., IPSN 2014*) and [airplanes.live](https://airplanes.live/).
+- **Weather:** [Open-Meteo](https://open-meteo.com/) (CC BY 4.0). Optional real observations: NOAA **MRMS**, **GOES-16/18 ABI**.
+- **Known seeders:** FAA Releasable Aircraft Database (public) + operators named in NOAA weather-modification activity reports (15 U.S.C. §330).
 
 ## License
 

@@ -1,9 +1,20 @@
-# CloudSeeding Data Collector — sample crontab entries
+# CloudSeeding Data Collector — sample crontab (for a plain VM, NOT Railway).
+# On Railway use `node start.js` (start.js → collect-loop.js handles all of this
+# in-process, since Railway has no system cron).
+#
 # Install with: crontab crontab.sample
-# Or append with: crontab -l | cat - crontab.sample | crontab -
+# Or append:    crontab -l | cat - crontab.sample | crontab -
 
-# Collect every 5 minutes
+# Collect every 5 minutes (ingest + layered analysis + compaction).
 */5 * * * * cd /path/to/collector && /usr/bin/node collect.js >> collector.log 2>&1
 
-# Optional: compact the database weekly (reclaims space from deleted rows)
-0 3 * * 0 cd /path/to/collector && sqlite3 cloudseeding.db "VACUUM;" >> collector.log 2>&1
+# Daily: storage report + in-place space reclaim (safe under a tight volume cap;
+# avoids a full VACUUM that needs ~2x scratch space).
+0 3 * * * cd /path/to/collector && /usr/bin/node monitor.js --vacuum >> collector.log 2>&1
+
+# Daily: rebuild the aggregate "repeat offender" ranking (permutation null + FDR).
+30 3 * * * cd /path/to/collector && /usr/bin/node run-aggregate.js >> collector.log 2>&1
+
+# One-time (manual): build the known-seeder registry from the FAA database.
+# Re-run monthly to catch new/changed registrations.
+# 0 4 1 * * cd /path/to/collector && /usr/bin/node fetch-faa-seeders.js >> collector.log 2>&1

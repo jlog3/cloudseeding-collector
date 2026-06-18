@@ -15,6 +15,12 @@ services:
       - DB_PATH=/app/data/cloudseeding.db
       - PORT=4000
       - COLLECT_INTERVAL_MS=300000
+      # Recommended: raise OpenSky limits (fixes 429s). Set in a .env file.
+      - OPENSKY_CLIENT_ID=${OPENSKY_CLIENT_ID:-}
+      - OPENSKY_CLIENT_SECRET=${OPENSKY_CLIENT_SECRET:-}
+      # Observation source for anomaly detection: openmeteo (default) | mrms | goes
+      - OBSERVATION_SOURCE=${OBSERVATION_SOURCE:-openmeteo}
+      # - OBSERVATION_SIDECAR_URL=${OBSERVATION_SIDECAR_URL:-}
     restart: unless-stopped
 
 volumes:

@@ -1,7 +1,7 @@
 {
   "name": "cloudseeding-collector",
-  "version": "1.0.0",
-  "description": "CONUS-wide flight + weather data collector for cloud seeding transparency analysis",
+  "version": "2.0.0",
+  "description": "CONUS-wide flight + weather collector with a layered, wind-coupled, observation-aware seeding detector and an aggregate repeat-offender test",
   "repository": {
     "type": "git",
     "url": "https://github.com/YOUR_USERNAME/cloudseeding-collector.git"
@@ -12,7 +12,11 @@
     "collect": "node collect.js",
     "collect:loop": "node collect-loop.js",
     "serve": "node serve.js",
-    "start": "node start.js"
+    "start": "node start.js",
+    "aggregate": "node run-aggregate.js",
+    "faa-seeders": "node fetch-faa-seeders.js",
+    "monitor": "node monitor.js",
+    "reset": "node reset-preservation.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -20,6 +24,8 @@
   "dependencies": {
     "better-sqlite3": "^11.0.0",
     "cors": "^2.8.5",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "adm-zip": "^0.5.10",
+    "csv-parse": "^5.5.0"
   }
 }
