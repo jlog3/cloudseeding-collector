@@ -70,6 +70,11 @@ async function main() {
   }
 
   const patterns = loadPatterns();
+  // Whole-word matching: "\bSEEDING OPERATIONS\b" matches the real operator but
+  // NOT substrings like "AGRISOAR" or unrelated names. (Bare substring matching
+  // was why a dozen soaring clubs + a law-marketing firm slipped in.)
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patternRes = patterns.map((p) => new RegExp("\\b" + escape(p) + "\\b", "i"));
   console.log(`Operator patterns (${patterns.length}): ${patterns.join(" | ")}\n`);
 
   const buf = await getZipBuffer();
@@ -106,9 +111,9 @@ async function main() {
 
   const matches = [];
   for (const r of master) {
-    const name = (r["NAME"] || "").toUpperCase();
+    const name = (r["NAME"] || "");
     if (!name) continue;
-    if (!patterns.some((p) => name.includes(p))) continue;
+    if (!patternRes.some((re) => re.test(name))) continue;
     const hex = (r["MODE S CODE HEX"] || "").trim().toLowerCase();
     if (!hex || !/^[0-9a-f]{6}$/.test(hex)) continue; // need a valid ICAO hex
     const nnum = (r["N-NUMBER"] || "").trim();
@@ -148,7 +153,13 @@ async function main() {
     VALUES (@icao24,@registration,@operator,@aircraft_type,@source)
     ON CONFLICT(icao24) DO UPDATE SET registration=excluded.registration, operator=excluded.operator,
       aircraft_type=excluded.aircraft_type, source=excluded.source`);
-  const tx = db.transaction(() => { for (const m of list) up.run(m); });
+  const tx = db.transaction(() => {
+    // Rebuild the FAA-sourced rows from scratch so a re-run reflects the current
+    // (corrected) patterns and drops any earlier false positives. Manual pins
+    // (source!='faa') are untouched.
+    db.prepare("DELETE FROM seeder_registry WHERE source = 'faa'").run();
+    for (const m of list) up.run(m);
+  });
   tx();
   const total = db.prepare("SELECT COUNT(*) n FROM seeder_registry").get().n;
   db.close();

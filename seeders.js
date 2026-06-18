@@ -97,16 +97,18 @@ function normHex(h) {
 // specific tail numbers as fact — those are resolved from the live FAA registry
 // by fetch-faa-seeders.js (or pinned by you in data/operators.json).
 const BUILTIN_OPERATOR_PATTERNS = [
-  "WEATHER MODIFICATION",            // Weather Modification International (WMI)
+  "WEATHER MODIFICATION",            // Weather Modification Inc (WMI) + the "... WEATHER MODIFICATION ASSOCIATION" TX/Trans-Pecos programs
   "NORTH AMERICAN WEATHER",          // North American Weather Consultants (NAWC)
   "WESTERN WEATHER",                 // Western Weather Consultants
-  "ICE CRYSTAL ENGINEERING",
-  "SOAR ",                           // SOAR / Seeding Operations & Atmospheric Research
-  "RHS CONSULTING",
+  "RHS CONSULTING",                  // RHS Consulting (NV)
+  "ICE CRYSTAL ENGINEERING",         // ICE (seeding flares/equipment + ops)
   "DESERT RESEARCH INSTITUTE",       // DRI (NV state programs)
-  "WEATHER MOD",
-  "CLOUD SEED",
-  "RAINMAKER",
+  "SEEDING OPERATIONS",              // SOAR = "Seeding Operations and Atmospheric Research" (Gary Walker, TX).
+                                     // NOTE: use this precise name, NOT bare "SOAR" — "soar" = gliding and
+                                     // matches dozens of unrelated soaring clubs / flight schools.
+  "RAINMAKER TECHNOLOGY",            // Rainmaker Technology Corp. NOT bare "RAINMAKER" (matched a law-marketing firm).
+  "CLOUD SEEDING",
+  "WEATHER ENHANCEMENT",
 ];
 
 function loadOperatorsFile() {
@@ -119,6 +121,18 @@ function loadOperatorsFile() {
     };
   } catch {
     return { patterns: [], pins: [] };
+  }
+}
+
+// FAA-derived airframes written by fetch-faa-seeders.js. Committing this file lets
+// the registry load on deploy without writing to the container DB (see loader).
+function loadSeedersJsonFile() {
+  const p = path.join(__dirname, "data", "seeders.json");
+  try {
+    const j = JSON.parse(fs.readFileSync(p, "utf8"));
+    return Array.isArray(j.aircraft) ? j.aircraft : [];
+  } catch {
+    return [];
   }
 }
 
@@ -147,6 +161,20 @@ function loadSeederRegistry(db) {
         source: "pin",
       });
     }
+  }
+
+  // Layer 1.5: data/seeders.json (FAA-derived, committed to the repo). Run
+  // fetch-faa-seeders.js locally, commit the JSON, and the registry loads on
+  // deploy with no container shell. The DB table below overrides if populated.
+  for (const a of loadSeedersJsonFile()) {
+    const hex = normHex(a.icao24);
+    if (!hex) continue;
+    byIcao.set(hex, {
+      operator: a.operator || "",
+      type: a.aircraft_type || a.type || "",
+      registration: (a.registration || "").toUpperCase(),
+      source: "faa-json",
+    });
   }
 
   // Layer 1: the FAA-derived table (authoritative)
