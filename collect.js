@@ -110,7 +110,7 @@ async function collect() {
   if (haveHour.n === 0) {
     console.log(`  Weather grid sweep for ${hourISO}...`);
     try {
-      const { current, forecasts, gridOk, gridErr, totalPoints } = await fetchWeatherGrid(nowISO);
+      const { current, forecasts, gridOk, gridErr, totalPoints, sampleError } = await fetchWeatherGrid(nowISO);
 
       const insWeather = db.prepare(`
         INSERT OR REPLACE INTO weather_grid
@@ -131,6 +131,7 @@ async function collect() {
       })();
 
       console.log(`  ✓ Weather: ${gridOk}/${totalPoints} grid points (${gridErr} errors), ${forecasts.length} forecast rows`);
+      if (gridErr > 0 && sampleError) console.log(`    ⚠ weather error sample: ${sampleError}`);
     } catch (err) {
       console.error(`  ✗ Weather: ${err.message}`);
     }

@@ -98,21 +98,26 @@ async function fetchOpenSky() {
   try { token = await getOpenskyToken(); } catch (e) { /* fall through to anon */ }
 
   const headers = token ? { Authorization: `Bearer ${token}` } : {};
-  // One retry with backoff on 429/5xx.
+  // One retry with backoff on 429/5xx OR a network-level throw (DNS/TLS/reset).
+  let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetchWithTimeout(url, { headers });
-    if (res.ok) {
-      const json = await res.json();
-      return { states: normOpenSky(json.states), authed: !!token };
+    try {
+      const res = await fetchWithTimeout(url, { headers });
+      if (res.ok) {
+        const json = await res.json();
+        return { states: normOpenSky(json.states), authed: !!token };
+      }
+      if (res.status === 429 || res.status >= 500) {
+        await sleep(2000 * (attempt + 1));
+        continue;
+      }
+      throw new Error(`OpenSky ${res.status}`);
+    } catch (e) {
+      lastErr = e;
+      if (attempt === 0) { await sleep(2000); continue; } // retry a transient network throw once
     }
-    if (res.status === 429 || res.status >= 500) {
-      const wait = 2000 * (attempt + 1);
-      await sleep(wait);
-      continue;
-    }
-    throw new Error(`OpenSky ${res.status}`);
   }
-  throw new Error("OpenSky rate-limited after retry");
+  throw new Error(lastErr ? lastErr.message : "OpenSky failed after retry");
 }
 
 // ── airplanes.live (tiled point queries to cover CONUS) ───────────────────────
@@ -158,23 +163,37 @@ async function fetchAirplanesLive() {
   const tiles = conusTiles(250);
   const seen = new Map(); // icao24 -> record (dedupe across overlapping tiles)
   let ok = 0, err = 0;
+  let sampleError = null;
   for (const t of tiles) {
-    try {
-      const url = `${SOURCES.airplanesLiveUrl}/point/${t.lat.toFixed(3)}/${t.lng.toFixed(3)}/250`;
-      const res = await fetchWithTimeout(url, {
-        headers: { "User-Agent": "cloudseeding-collector/2.0 (transparency research)" },
-      }, 15000);
-      if (!res.ok) { err++; await sleep(250); continue; }
-      const json = await res.json();
-      for (const rec of normAirplanesLive(json.ac)) {
-        if (rec.icao24 && !seen.has(rec.icao24)) seen.set(rec.icao24, rec);
+    const url = `${SOURCES.airplanesLiveUrl}/point/${t.lat.toFixed(3)}/${t.lng.toFixed(3)}/250`;
+    let done = false;
+    for (let attempt = 0; attempt < 2 && !done; attempt++) {
+      try {
+        const res = await fetchWithTimeout(url, {
+          headers: { "User-Agent": "cloudseeding-collector/2.0 (transparency research)" },
+        }, 15000);
+        if (!res.ok) {
+          if (!sampleError) sampleError = `tile ${res.status}`;
+          // 429 = too fast: wait longer and retry once before giving up on the tile.
+          if (res.status === 429 && attempt === 0) { await sleep(2000); continue; }
+          err++; done = true; break;
+        }
+        const json = await res.json();
+        for (const rec of normAirplanesLive(json.ac)) {
+          if (rec.icao24 && !seen.has(rec.icao24)) seen.set(rec.icao24, rec);
+        }
+        ok++; done = true;
+      } catch (e) {
+        if (!sampleError) sampleError = e.message;
+        if (attempt === 0) { await sleep(1500); continue; }
+        err++; done = true;
       }
-      ok++;
-    } catch { err++; }
-    await sleep(250); // be polite to the free endpoint
+    }
+    // airplanes.live free tier is ~1 request/second — pace accordingly.
+    await sleep(1100);
   }
-  if (ok === 0) throw new Error("airplanes.live: all tiles failed");
-  return { states: [...seen.values()], tilesOk: ok, tilesErr: err };
+  if (ok === 0) throw new Error("all tiles failed" + (sampleError ? " (" + sampleError + ")" : ""));
+  return { states: [...seen.values()], tilesOk: ok, tilesErr: err, sampleError };
 }
 
 /**
@@ -200,7 +219,8 @@ async function fetchFlights() {
     try {
       const r = await fetchAirplanesLive();
       meta.source = "airplanes.live";
-      meta.notes.push(`airplanes.live tiles ok=${r.tilesOk} err=${r.tilesErr}`);
+      meta.notes.push(`airplanes.live tiles ok=${r.tilesOk} err=${r.tilesErr}` +
+        (r.tilesErr > 0 && r.sampleError ? ` (${r.sampleError})` : ""));
       return { states: r.states, meta };
     } catch (e) {
       meta.notes.push(`airplanes.live failed: ${e.message}`);

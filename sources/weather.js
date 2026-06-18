@@ -23,7 +23,7 @@ const HOURLY_VARS = [
   "temperature_2m", "relative_humidity_2m", "precipitation",
   "precipitation_probability", "cloud_cover", "cloud_cover_low",
   "cloud_cover_mid", "cloud_cover_high", "wind_speed_10m",
-  "wind_direction_10m", "pressure_msl", "dewpoint_2m", "visibility",
+  "wind_direction_10m", "pressure_msl", "dew_point_2m", "visibility",
   "freezing_level_height",
 ];
 
@@ -53,7 +53,14 @@ async function fetchBatch(points) {
   let json;
   try {
     const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`Open-Meteo ${res.status}`);
+    if (!res.ok) {
+      // Open-Meteo returns a JSON {reason: "..."} body on 400 (e.g. a bad
+      // variable name) — surface it so the failure is diagnosable, not silent.
+      let reason = "";
+      try { const b = await res.json(); reason = b.reason || JSON.stringify(b).slice(0, 160); }
+      catch { try { reason = (await res.text()).slice(0, 160); } catch {} }
+      throw new Error(`Open-Meteo ${res.status}${reason ? ": " + reason : ""}`);
+    }
     json = await res.json();
   } finally {
     clearTimeout(t);
@@ -95,7 +102,7 @@ function rowsFromHourly(point, hourly, issuedAtISO) {
     cloud_cover_mid: pick("cloud_cover_mid", idx),
     cloud_cover_high: pick("cloud_cover_high", idx),
     pressure: pick("pressure_msl", idx),
-    dewpoint: pick("dewpoint_2m", idx),
+    dewpoint: pick("dew_point_2m", idx),
     visibility: pick("visibility", idx),
     freezing_level_m: pick("freezing_level_height", idx),
   });
@@ -121,16 +128,26 @@ function rowsFromHourly(point, hourly, issuedAtISO) {
  * Sweep the whole grid. Returns { current: [...gridRows], forecasts: [...] }.
  * Batches the grid into chunks (Open-Meteo limits coords per request).
  */
-async function fetchWeatherGrid(issuedAtISO, { batchSize = 100 } = {}) {
+async function fetchWeatherGrid(issuedAtISO, { batchSize = 50 } = {}) {
   const pts = gridPoints();
   const current = [];
   const forecasts = [];
   let ok = 0, err = 0;
+  let sampleError = null;
 
   for (let i = 0; i < pts.length; i += batchSize) {
     const chunk = pts.slice(i, i + batchSize);
-    try {
-      const results = await fetchBatch(chunk);
+    let results = null;
+    for (let attempt = 0; attempt < 2 && !results; attempt++) {
+      try {
+        results = await fetchBatch(chunk);
+      } catch (e) {
+        if (!sampleError) sampleError = e.message;
+        if (attempt === 0) { await sleep(1500); continue; } // one retry (e.g. transient 429)
+        err += chunk.length;
+      }
+    }
+    if (results) {
       for (const r of results) {
         if (!r.hourly?.time) { err++; continue; }
         const { current: cur, forecasts: fc } = rowsFromHourly(r.point, r.hourly, issuedAtISO);
@@ -138,13 +155,11 @@ async function fetchWeatherGrid(issuedAtISO, { batchSize = 100 } = {}) {
         for (const f of fc) forecasts.push(f);
         ok++;
       }
-    } catch (e) {
-      err += chunk.length;
     }
     await sleep(300); // gentle pacing between batches
   }
 
-  return { current, forecasts, gridOk: ok, gridErr: err, totalPoints: pts.length };
+  return { current, forecasts, gridOk: ok, gridErr: err, totalPoints: pts.length, sampleError };
 }
 
 module.exports = { fetchWeatherGrid, gridPoints, HOURLY_VARS };
