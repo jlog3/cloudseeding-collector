@@ -79,7 +79,18 @@ async function main() {
   const acftrefCsv = findEntry(zip, "ACFTREF.txt");
   if (!masterCsv) throw new Error("MASTER.txt not found in the FAA zip");
 
-  const parseOpts = { columns: (h) => h.map((c) => c.trim()), relax_column_count: true, skip_empty_lines: true, trim: true };
+  // The FAA files are comma-separated but NOT RFC-4180 quoted — values like
+  // 'JR ACE "' contain literal quotes. relax_quotes treats those as data;
+  // skip_records_with_error drops any remaining malformed row instead of
+  // aborting the whole import.
+  const parseOpts = {
+    columns: (h) => h.map((c) => c.trim()),
+    relax_column_count: true,
+    relax_quotes: true,
+    skip_records_with_error: true,
+    skip_empty_lines: true,
+    trim: true,
+  };
   const master = csvParse(masterCsv, parseOpts);
   const acftref = acftrefCsv ? csvParse(acftrefCsv, parseOpts) : [];
 
@@ -142,7 +153,11 @@ async function main() {
   const total = db.prepare("SELECT COUNT(*) n FROM seeder_registry").get().n;
   db.close();
   console.log(`Upserted into seeder_registry. Registry now holds ${total} airframe(s).`);
-  console.log(`\nDone. The collector matches live icao24 against this registry on its next cycle.`);
+  console.log(`\nDone.`);
+  console.log(`• Local run? Commit data/seeders.json — the collector loads it on deploy:`);
+  console.log(`    git add data/seeders.json && git commit -m "update seeder registry" && git push`);
+  console.log(`• In-container run? It already wrote the DB table; no commit needed.`);
+  console.log(`The collector matches live icao24 against this registry on its next cycle.`);
 }
 
 main().catch((e) => { console.error("Importer error:", e.message); process.exit(1); });

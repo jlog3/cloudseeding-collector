@@ -34,9 +34,11 @@ const CONUS = {
 
 // Weather grid spacing in degrees. Coarse grid is only the *baseline* layer;
 // fine-scale anomaly structure is meant to come from the observation adapter
-// (radar/satellite). 2° ≈ 140 mi — fine for a synoptic baseline, far too coarse
-// to resolve a seeding plume on its own.
-const WEATHER_GRID_STEP = num("WEATHER_GRID_STEP", 2);
+// (radar/satellite). 2.5° ≈ 170 mi — fine for a synoptic baseline, and ~264
+// CONUS points keeps the once-hourly sweep under Open-Meteo's free 10k/day limit
+// (2° = 420 pts = 10,080/day, which exceeds it). Set 3 for more headroom on a
+// shared egress IP, or 2 if you have a paid/self-hosted Open-Meteo endpoint.
+const WEATHER_GRID_STEP = num("WEATHER_GRID_STEP", 2.5);
 
 // ── Altitude bands (feet) ────────────────────────────────────────────────────
 // The *storage* band is wide (keep anything plausibly operational). The
